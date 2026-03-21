@@ -69,17 +69,7 @@ git clone <repository-url>
 cd Driver-Drowsiness-Detection
 ```
 
-### Step 2: Activate Virtual Environment
-
-**Windows (CMD):**
-```cmd
-call drowzy\Scripts\activate.bat
-```
-
-**Windows (PowerShell):**
-```powershell
-drowzy\Scripts\Activate.ps1
-```
+### Step 2: Create & Activate Virtual Environment
 
 ### Step 3: Install Dependencies
 
@@ -115,14 +105,6 @@ python src\drowsiness_detector.py
 
 ### Training Models
 
-Train all models sequentially:
-
-```bash
-scripts\run_all_training.cmd
-```
-
-Or train individually:
-
 ```bash
 # Train Eye CNN
 python src\eye_cnn_training.py --dataset dataset --out models\cnn_model.h5 --epochs 15
@@ -133,21 +115,6 @@ python src\mouth_cnn_training.py
 # Train EAR-based ML Classifier
 python src\ml_classifier_training.py --dataset dataset --out models\ml_model.pkl
 ```
-
-### Testing Setup
-
-Run smoke tests to verify installation:
-
-```bash
-# Test imports
-python scripts\smoke_test_imports.py
-
-# Test detector with limited frames
-python scripts\detector_smoke_test.py
-python scripts\detector_limited_run.py
-```
-
----
 
 ## 📁 Project Structure
 
@@ -309,53 +276,6 @@ EAR = (vertical_distances_sum) / (2 * horizontal_distance)
 - `crop_eye(image, eye_points, margin, size)`: Crops eye/mouth region from image with padding
 
 **Usage**: Used throughout the project for extracting specific facial regions for CNN processing
-
----
-
-### Script Files (`scripts/`)
-
-#### `detector_limited_run.py`
-**Purpose**: Test detector with limited frame count
-
-**Functionality**:
-- Runs detector for specified number of frames (default: 100)
-- Useful for testing without running indefinitely
-- Prints alert summaries and statistics
-- Validates model loading and camera access
-
----
-
-#### `detector_smoke_test.py`
-**Purpose**: Comprehensive system smoke test
-
-**Functionality**:
-- Verifies all model files exist and can be loaded
-- Tests dlib predictor and detector initialization
-- Captures sample frames from webcam
-- Detects faces and extracts landmarks
-- Reports system readiness status
-
----
-
-#### `smoke_test_imports.py`
-**Purpose**: Verify all required Python packages are installed
-
-**Functionality**:
-- Tests imports for all critical dependencies
-- Reports success/failure for each module
-- Quick diagnostic tool for installation issues
-
----
-
-#### `run_all_training.cmd`
-**Purpose**: Batch script to train all models sequentially
-
-**Functionality**:
-- Activates virtual environment
-- Runs all three training scripts in order
-- Logs output to separate files
-- Handles errors and reports failures
-- Windows CMD batch script
 
 ---
 
