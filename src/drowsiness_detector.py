@@ -30,7 +30,8 @@ SAVE_DEBUG_DIR = os.path.join(PROJECT_ROOT, 'outputs', 'debug_mouth')
 ALERT_LOG = os.path.join(PROJECT_ROOT, 'outputs', 'alerts.log')
 os.makedirs(ASSETS_DIR, exist_ok=True)
 os.makedirs(SAVE_DEBUG_DIR, exist_ok=True)
-ALERT_SOUND_PATH = os.path.join(ASSETS_DIR, 'siren-alert.mp3')
+DROWSY_SOUND_PATH = os.path.join(ASSETS_DIR, 'drowsy_alert.mp3')
+CONCENTRATE_SOUND_PATH = os.path.join(ASSETS_DIR, 'concentrate_alert.mp3')
 
 # Global counters and state
 ear_counter = 0
@@ -39,6 +40,7 @@ yawn_counter = 0
 side_start_time = None
 last_audio_alert = 0.0
 frame_counter = 0
+heavy_process_frame = 0
 last_fps_time = 0.0
 fps = 0.0
 
@@ -84,44 +86,96 @@ except ImportError:
     TTS_AVAILABLE = False
     print("pyttsx3 not installed for TTS fallback. Install with: pip install pyttsx3")
 
-def play_audio_alert():
-    """Play alert: MP3 → Beep → TTS fallback."""
+tts_lock = threading.Lock()
+tts_engine = None
+
+def play_drowsy_alert():
+    """Play drowsiness alert: MP3 → TTS → Beep."""
     def _play():
-        print("[AUDIO] Alert triggered!")
-        print(f"[AUDIO] MP3 exists: {os.path.exists(ALERT_SOUND_PATH)}")
+        print("[AUDIO] Drowsy alert!")
+        sound_path = DROWSY_SOUND_PATH
         played = False
-        # 1. MP3 siren
-        if playsound and os.path.exists(ALERT_SOUND_PATH):
+        # 1. MP3
+        if playsound and os.path.exists(sound_path):
             try:
-                print("[AUDIO] Playing MP3...")
-                playsound(ALERT_SOUND_PATH)
-                print("[AUDIO] MP3 success!")
+                playsound(sound_path)
                 played = True
             except Exception as e:
                 print(f"[AUDIO] MP3 failed: {e}")
-        elif playsound:
-            print("[AUDIO] MP3 file missing")
-        # 2. Windows beep
+        # 2. TTS
+        if not played and TTS_AVAILABLE:
+            if safe_tts_say("Pull over to rest! Drowsiness detected."):
+                played = True
+        # 3. Beep
         if not played and platform.system() == "Windows":
             try:
                 import winsound
-                winsound.Beep(2500, 700)
-                winsound.Beep(2000, 500)
+                winsound.Beep(800, 1000)
                 played = True
-            except Exception:
+            except:
                 pass
-        # 3. TTS fallback
-        if not played and TTS_AVAILABLE:
-            try:
-                engine = pyttsx3.init()
-                engine.say("Alert! Stay awake for safe driving!")
-                engine.runAndWait()
-            except Exception:
-                pass
-
     threading.Thread(target=_play, daemon=True).start()
 
-def preprocess(img):
+def play_concentrate_alert():
+    """Play concentrate alert: MP3 → TTS → Beep."""
+    def _play():
+        print("[AUDIO] Concentrate alert!")
+        sound_path = CONCENTRATE_SOUND_PATH
+        played = False
+        # 1. MP3
+        if playsound and os.path.exists(sound_path):
+            try:
+                playsound(sound_path)
+                played = True
+            except Exception as e:
+                print(f"[AUDIO] MP3 failed: {e}")
+        # 2. TTS
+        if not played and TTS_AVAILABLE:
+            if safe_tts_say("Please concentrate! Eyes on the road."):
+                played = True
+        # 3. Beep
+        if not played and platform.system() == "Windows":
+            try:
+                import winsound
+                winsound.Beep(1200, 600)
+                played = True
+            except:
+                pass
+    threading.Thread(target=_play, daemon=True).start()
+
+def safe_tts_say(message):
+    """Safely use global TTS engine with loop reset."""
+    global tts_engine, TTS_AVAILABLE, tts_lock
+    if not TTS_AVAILABLE:
+        return False
+    with tts_lock:
+        try:
+            if tts_engine is None:
+                temp_engine = pyttsx3.init()
+                voices = temp_engine.getProperty('voices')
+                if voices:
+                    temp_engine.setProperty('voice', voices[0].id)
+                    temp_engine.setProperty('rate', 180)
+                    tts_engine = temp_engine
+                else:
+                    raise RuntimeError("No TTS voices available")
+            tts_engine.stop()  # Reset any active loop
+            tts_engine.say(message)
+            tts_engine.runAndWait()
+            return True
+        except Exception as e:
+            print(f"[TTS] Failed permanently: {e}")
+            TTS_AVAILABLE = False
+            if tts_engine is not None:
+                try:
+                    tts_engine.stop()
+                    tts_engine = None
+                except:
+                    pass
+            return False
+
+def preprocess_rgb(img):
+    """Preprocess for RGB models (eyes) - outputs (1,64,64,3)"""
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     resized = cv2.resize(gray, (64, 64))
     norm = resized.astype('float32') / 255.0
@@ -129,167 +183,21 @@ def preprocess(img):
     norm = np.repeat(norm, 3, axis=-1)  # Repeat to RGB (1,64,64,3) for eye_cnn
     return norm
 
-def detect_drowsiness(frame, detector, predictor):
-    global ear_counter, eye_cnn_counter, yawn_counter, side_start_time, last_audio_alert, frame_counter
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    faces = detector(gray, 0)
-    num_faces = len(faces)
-    if num_faces == 0:
-        print(f"[DEBUG] No faces detected in frame {frame_counter}")
-    elif num_faces > 1:
-        print(f"[DEBUG] Multiple faces ({num_faces}) in frame {frame_counter}")
-    else:
-        print(f"[DEBUG] Face detected in frame {frame_counter}")
-    
-    for face in faces:
-        shape = predictor(gray, face)
-        coords = shape_to_coords(shape)
-        
-        left_eye = np.array(get_left_eye(coords))
-        right_eye = np.array(get_right_eye(coords))
-        
-        left_ear = eye_aspect_ratio(left_eye)
-        right_ear = eye_aspect_ratio(right_eye)
-        ear = (left_ear + right_ear) / 2.0
-
-        try:
-            ml_pred = ear_model.predict([[left_ear, right_ear, ear]])[0][0]  # Get probability of closed (class 1)
-        except Exception as e:
-            print(f"[ERROR] ML pred failed: {e}")
-            ml_pred = 0.0
-
-        try:
-            left_eye_region = crop_eye(frame, list(left_eye))
-            right_eye_region = crop_eye(frame, list(right_eye))
-            left_input = preprocess(left_eye_region)
-            right_input = preprocess(right_eye_region)
-            left_prob = eye_cnn.predict(left_input)[0][0]
-            right_prob = eye_cnn.predict(right_input)[0][0]
-            eye_prob = (left_prob + right_prob) / 2.0
-        except Exception as e:
-            print(f"[ERROR] Eye CNN failed: {e}")
-            eye_prob = 0.0
-        eye_closed = eye_prob >= EYE_CNN_CLOSE_THRESH
-
-        mouth = coords[48:68]
-        try:
-            mouth_region = crop_region(frame, mouth)
-            mouth_input = preprocess(mouth_region)
-            yawn_prob = mouth_cnn.predict(mouth_input)[0][0]
-        except Exception as e:
-            print(f"[ERROR] Mouth CNN failed: {e}")
-            yawn_prob = 0.0
-
-        try:
-            if yawn_prob >= SAVE_DEBUG_THRESH:
-                ts = datetime.datetime.now().strftime('%Y%m%d_%H%M%S_%f')
-                fname = os.path.join(SAVE_DEBUG_DIR, f'mouth_{ts}.jpg')
-                cv2.imwrite(fname, mouth_region)
-                with open(ALERT_LOG, 'a', encoding='utf-8') as lf:
-                    lf.write(f"{ts}, MOUTH_CROP_SAVED, yawn_prob={yawn_prob:.3f}\n")
-        except Exception:
-            pass
-
-        x_coords = [p[0] for p in coords]
-        minx, maxx = min(x_coords), max(x_coords)
-        nose_x = coords[30][0]
-        face_w = maxx - minx if (maxx - minx) > 0 else 1
-        nose_norm = (nose_x - minx) / face_w
-        side_looking = (nose_norm < SIDE_LEFT_RATIO) or (nose_norm > SIDE_RIGHT_RATIO)
-        if side_looking:
-            if side_start_time is None:
-                side_start_time = time.time()
-            side_duration = time.time() - side_start_time
-        else:
-            side_start_time = None
-            side_duration = 0.0
-
-        # Drowsiness detection logic
-        # EAR check
-        if ear < EAR_THRESHOLD:
-            ear_counter += 1
-        else:
-            ear_counter = 0
-
-        # Eye CNN check
-        if eye_closed:
-            eye_cnn_counter += 1
-        else:
-            eye_cnn_counter = 0
-
-        # Yawn check
-        if yawn_prob >= YAWN_THRESH:
-            yawn_counter += 1
-        else:
-            yawn_counter = 0
-
-# Fused drowsiness probability
-        ear_factor = 1.0 if ear < EAR_THRESHOLD else 0.0
-        eye_factor = 1.0 if eye_closed else eye_prob  # Use prob if not binary
-        yawn_factor = yawn_prob
-        ml_factor = ml_pred
-        side_factor = min(1.0, side_duration / SIDE_LOOK_THRESH)
-        drowsy_prob = 0.25 * (ear_factor + eye_factor + yawn_factor + ml_factor + side_factor)
-        if frame_counter % 30 == 0:
-            print(f"[DETECT] Frame{frame_counter} EAR:{ear:.2f} eye:{eye_prob:.2f} yawn:{yawn_prob:.2f} drowsy:{drowsy_prob:.2f} side:{side_duration:.1f}")
-
-        # Update counters
-        if drowsy_prob >= DROWSY_PROB_THRESH:
-            ear_counter += 1
-        elif drowsy_prob < DROWSY_RESET_THRESH:
-            ear_counter = max(0, ear_counter - 1)
-            eye_cnn_counter = max(0, eye_cnn_counter - 1)
-            yawn_counter = max(0, yawn_counter - 1)
-
-        # Alert conditions
-        alert_active = (ear_counter >= EAR_CONSEC_FRAMES or 
-                       eye_cnn_counter >= EYE_CNN_CONSEC or 
-                       yawn_counter >= YAWN_CONSEC or 
-                       side_duration >= SIDE_LOOK_THRESH or
-                       drowsy_prob >= DROWSY_PROB_THRESH)
-        if alert_active:
-            print(f"[ALERT] TRIGGERED! drowsy_prob={drowsy_prob:.2f} ear_counter={ear_counter} eye_cnn={eye_cnn_counter} yawn={yawn_counter} side={side_duration:.1f}")
-            if side_duration >= SIDE_LOOK_THRESH:
-                msg = "LOOK AHEAD - SAFETY FIRST!"
-            elif yawn_prob >= YAWN_THRESH:
-                msg = "TAKE A BREAK - STAY ALERT!"
-            else:
-                msg = "DROWSY! SAFETY DRIVING - WAKE UP!"
-            msg2 = f"Drowsy Prob: {drowsy_prob:.2f}"
-
-            now = time.time()
-            if now - last_audio_alert >= ALERT_AUDIO_COOLDOWN:
-                play_audio_alert()
-                last_audio_alert = now
-
-            cv2.putText(frame, msg, (20,40),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0,0,255), 3)
-            cv2.putText(frame, msg2, (20,80),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,0,255), 2)
-            cv2.rectangle(frame, (0,0), (frame.shape[1],frame.shape[0]),
-                          (0,0,255), 5)
-        else:
-            cv2.putText(frame, "SAFE DRIVING - Eyes Open!", (10, 90), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 3)
-
-        # Draw face box, EAR, probs
-        cv2.rectangle(frame, (face.left(), face.top()), (face.right(), face.bottom()), (0, 255, 0), 2)
-        cv2.putText(frame, f"EAR: {ear:.2f}", (20,80),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,0), 2)
-        cv2.putText(frame, f"Eye Prob: {eye_prob:.2f}", (20,110),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,0), 2)
-        cv2.putText(frame, f"Yawn Prob: {yawn_prob:.2f}", (20,140),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,0), 2)
-        cv2.putText(frame, f"NosePos: {nose_norm:.2f}", (20,170),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200,200,0), 2)
-        if side_duration > 0:
-            cv2.putText(frame, f"SideSecs: {side_duration:.1f}s", (20,200),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200,200,0), 2)
-
-    return frame
+def preprocess_grayscale(img):
+    """Preprocess for grayscale models (mouth) - outputs (1,64,64,1)"""
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    resized = cv2.resize(gray, (64, 64))
+    norm = resized.astype('float32') / 255.0
+    norm = np.expand_dims(norm, axis=-1)  # Grayscale channel (64,64,1)
+    norm = np.expand_dims(norm, axis=0)   # Batch dim (1,64,64,1)
+    return norm
 
 def crop_region(image, points, margin=10, size=(64,64)):
-    # Similar to crop_eye but general for region (e.g., mouth)
+    """Crop region (mouth/eyes) safely with empty check."""
+    if len(points) < 3:
+        empty = np.zeros((*size, 3), dtype=np.uint8)
+        return empty
+        
     xs = [p[0] for p in points]
     ys = [p[1] for p in points]
     minx, maxx = min(xs), max(xs)
@@ -299,10 +207,236 @@ def crop_region(image, points, margin=10, size=(64,64)):
     y1 = max(0, miny - margin)
     x2 = min(w, maxx + margin)
     y2 = min(h, maxy + margin)
+    
+    if x2 <= x1 or y2 <= y1:
+        empty = np.zeros((*size, 3), dtype=np.uint8)
+        return empty
+        
     crop = image[y1:y2, x1:x2]
-    if crop.size > 0:
-        crop = cv2.resize(crop, size)
+    crop = cv2.resize(crop, size)
     return crop
+
+def detect_drowsiness(frame, detector, predictor):
+    global ear_counter, eye_cnn_counter, yawn_counter, side_start_time, last_audio_alert, frame_counter
+    if frame is None:
+        return None
+    # Preprocess for robust detection
+    gray_raw = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+    gray = clahe.apply(gray_raw)
+    # Gamma correction
+    gamma = 1.2
+    gray = np.power(gray / 255.0, gamma) * 255.0
+    gray = np.clip(gray, 0, 255).astype(np.uint8)
+
+    # Multi-scale dlib (0-2) for speed
+    faces = []
+    max_faces_scale = -1
+    for scale in range(3):
+        scale_faces = detector(gray, scale)
+        if len(scale_faces) > 0:
+            faces = scale_faces
+            max_faces_scale = scale
+            break
+
+    if len(faces) == 0:
+        # Fast Haar fallback, no debug prints
+        try:
+            haar_path = os.path.join(PROJECT_ROOT, 'assets', 'haarcascade_frontalface_default.xml')
+            if os.path.exists(haar_path):
+                face_cascade = cv2.CascadeClassifier(haar_path)
+            else:
+                face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+            faces_cv = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(30,30))
+            for (x, y, w, h) in faces_cv:
+                faces.append(dlib.rectangle(int(x), int(y), int(x+w), int(y+h)))
+        except Exception:
+            pass
+
+    global heavy_process_frame
+    heavy_process_frame = frame_counter % 2 == 0
+    
+    num_faces = len(faces)
+    if frame_counter % 60 == 0:
+        if max_faces_scale >= 0:
+            print(f"[DEBUG] Best detection scale: {max_faces_scale}")
+        if num_faces == 0:
+            print("[DEBUG] No faces")
+        elif num_faces > 1:
+            print(f"[DEBUG] Multiple faces ({num_faces})")
+        else:
+            print("[DEBUG] Single face")
+    
+    if num_faces == 0:
+        if frame_counter % 120 == 0:
+            noface_dir = os.path.join(PROJECT_ROOT, 'outputs', 'debug_no_face')
+            os.makedirs(noface_dir, exist_ok=True)
+            fname = os.path.join(noface_dir, f'no_face_f{frame_counter:06d}.jpg')
+            if frame is not None:
+                cv2.imwrite(fname, frame)
+        return frame
+        
+    if num_faces > 1:
+        face = max(faces, key=lambda f: (f.right() - f.left()) * (f.bottom() - f.top()))
+    else:
+        face = faces[0]
+
+    # Validate face size (too small = invalid)
+    if face.width() < 50 or face.height() < 50:
+        return frame
+
+    shape = predictor(gray, face)
+    coords = shape_to_coords(shape)
+
+    left_eye = np.array(get_left_eye(coords))
+    right_eye = np.array(get_right_eye(coords))
+
+    left_ear = eye_aspect_ratio(left_eye)
+    right_ear = eye_aspect_ratio(right_eye)
+    ear = (left_ear + right_ear) / 2.0
+
+    eye_prob = 0.5
+    yawn_prob = 0.0
+    ml_pred = 0.0
+    if heavy_process_frame:
+        try:
+            ml_pred = ear_model.predict_proba([[left_ear, right_ear, ear]])[:, 1][0]
+            
+            # Eye CNN
+            left_eye_region = crop_eye(frame, list(left_eye))
+            right_eye_region = crop_eye(frame, list(right_eye))
+            left_input = preprocess_rgb(left_eye_region)
+            right_input = preprocess_rgb(right_eye_region)
+            left_prob = eye_cnn.predict(left_input, verbose=0)[0][0]
+            right_prob = eye_cnn.predict(right_input, verbose=0)[0][0]
+            eye_prob = (left_prob + right_prob) / 2.0
+            
+            # Mouth CNN
+            mouth = coords[48:68]
+            mouth_region = crop_region(frame, mouth)
+            mouth_input = preprocess_grayscale(mouth_region)
+            yawn_prob = mouth_cnn.predict(mouth_input, verbose=0)[0][0]
+        except Exception:
+            pass
+    eye_closed = eye_prob >= EYE_CNN_CLOSE_THRESH
+
+    try:
+        if yawn_prob >= SAVE_DEBUG_THRESH:
+            ts = datetime.datetime.now().strftime('%Y%m%d_%H%M%S_%f')
+            fname = os.path.join(SAVE_DEBUG_DIR, f'mouth_{ts}.jpg')
+            cv2.imwrite(fname, mouth_region)
+            with open(ALERT_LOG, 'a', encoding='utf-8') as lf:
+                lf.write(f"{ts}, MOUTH_CROP_SAVED, yawn_prob={yawn_prob:.3f}\n")
+    except Exception:
+        pass
+
+    x_coords = [p[0] for p in coords]
+    minx, maxx = min(x_coords), max(x_coords)
+    nose_x = coords[30][0]
+    face_w = maxx - minx if (maxx - minx) > 0 else 1
+    nose_norm = (nose_x - minx) / face_w
+    side_looking = (nose_norm < SIDE_LEFT_RATIO) or (nose_norm > SIDE_RIGHT_RATIO)
+    if side_looking:
+        if side_start_time is None:
+            side_start_time = time.time()
+        side_duration = time.time() - side_start_time
+    else:
+        side_start_time = None
+        side_duration = 0.0
+
+    # Drowsiness detection logic
+    # EAR check
+    if ear < EAR_THRESHOLD:
+        ear_counter += 1
+    else:
+        ear_counter = 0
+
+    # Eye CNN check
+    if eye_closed:
+        eye_cnn_counter += 1
+    else:
+        eye_cnn_counter = 0
+
+    # Yawn check
+    if yawn_prob >= YAWN_THRESH:
+        yawn_counter += 1
+    else:
+        yawn_counter = 0
+
+    # Fused drowsiness probability
+    ear_factor = 1.0 if ear < EAR_THRESHOLD else 0.0
+    eye_factor = 1.0 if eye_closed else eye_prob  # Use prob if not binary
+    yawn_factor = yawn_prob
+    ml_factor = ml_pred
+    side_factor = min(1.0, side_duration / SIDE_LOOK_THRESH)
+    drowsy_prob = 0.25 * (ear_factor + eye_factor + yawn_factor + ml_factor + side_factor)
+    if frame_counter % 30 == 0:
+        print(f"[DETECT] Frame{frame_counter} EAR:{ear:.2f} eye:{eye_prob:.2f} yawn:{yawn_prob:.2f} drowsy:{drowsy_prob:.2f} side:{side_duration:.1f}")
+
+    # Update counters
+    if drowsy_prob >= DROWSY_PROB_THRESH:
+        ear_counter += 1
+    elif drowsy_prob < DROWSY_RESET_THRESH:
+        ear_counter = max(0, ear_counter - 1)
+        eye_cnn_counter = max(0, eye_cnn_counter - 1)
+        yawn_counter = max(0, yawn_counter - 1)
+
+    # Alert conditions
+    alert_active = (ear_counter >= EAR_CONSEC_FRAMES or 
+                   eye_cnn_counter >= EYE_CNN_CONSEC or 
+                   yawn_counter >= YAWN_CONSEC or 
+                   side_duration >= SIDE_LOOK_THRESH or
+                   drowsy_prob >= DROWSY_PROB_THRESH)
+    if alert_active:
+        print(f"[ALERT] TRIGGERED! drowsy_prob={drowsy_prob:.2f} ear_counter={ear_counter} eye_cnn={eye_cnn_counter} yawn={yawn_counter} side={side_duration:.1f}")
+        # Task-specific warnings
+        is_drowsy = (ear_counter >= EAR_CONSEC_FRAMES or eye_cnn_counter >= EYE_CNN_CONSEC or 
+                    yawn_counter >= YAWN_CONSEC or drowsy_prob >= DROWSY_PROB_THRESH)
+        is_looking_away = side_duration >= SIDE_LOOK_THRESH
+        
+        if is_drowsy:
+            drowsy_msgs = ["PULLOVER TO REST!", "DROWSINESS DETECTED - REST NOW!", "TAKE A BREAK - SAFETY FIRST!"]
+            msg = drowsy_msgs[frame_counter % len(drowsy_msgs)]
+            play_drowsy_alert()
+        elif is_looking_away:
+            concentrate_msgs = ["PLEASE CONCENTRATE!", "EYES ON ROAD!", "FOCUS FORWARD - SAFETY!"]
+            msg = concentrate_msgs[frame_counter % len(concentrate_msgs)]
+            play_concentrate_alert()
+        else:
+            msg = "Alert Active!"
+        
+        msg2 = f"Drowsy: {drowsy_prob:.1f} | Side: {side_duration:.1f}s"
+
+        now = time.time()
+        if now - last_audio_alert >= ALERT_AUDIO_COOLDOWN:
+            last_audio_alert = now
+
+        # Red border + warnings
+        cv2.rectangle(frame, (0,0), (frame.shape[1],frame.shape[0]), (0,0,255), 5)
+        cv2.putText(frame, msg, (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0,0,255), 3)
+        cv2.putText(frame, msg2, (20, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,0,255), 2)
+        
+    else:
+        # Safe: Green ROAD FOCUS ON
+        cv2.putText(frame, "ROAD FOCUS: ON ✓", (20, 50), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 3)
+        cv2.rectangle(frame, (0,0), (frame.shape[1],frame.shape[0]), (0,255,0), 2)
+
+    # Draw face box, EAR, probs
+    cv2.rectangle(frame, (face.left(), face.top()), (face.right(), face.bottom()), (0, 255, 0), 2)
+    cv2.putText(frame, f"EAR: {ear:.2f}", (20,80),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,0), 2)
+    cv2.putText(frame, f"Eye Prob: {eye_prob:.2f}", (20,110),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,0), 2)
+    cv2.putText(frame, f"Yawn Prob: {yawn_prob:.2f}", (20,140),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,0), 2)
+    cv2.putText(frame, f"NosePos: {nose_norm:.2f}", (20,170),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200,200,0), 2)
+    if side_duration > 0:
+        cv2.putText(frame, f"SideSecs: {side_duration:.1f}s", (20,200),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200,200,0), 2)
+
+    return frame
 
 def main():
     """Main function to run the drowsiness detector."""
@@ -324,6 +458,14 @@ def main():
     cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+    
+    # Warmup camera pipeline
+    print("Warming up camera...")
+    for _ in range(30):
+        ret, _ = cap.read()
+        if ret:
+            cv2.waitKey(1)
+    print("Camera warmed up.")
     
     print("Drowsiness Detector started. Press 'q' to quit.")
 
@@ -373,6 +515,13 @@ def main():
         if key == 27 or key == ord('q'):  # ESC or q
             break
 
+    global tts_engine
+    if tts_engine is not None:
+        try:
+            tts_engine.stop()
+            tts_engine = None
+        except:
+            pass
     cap.release()
     cv2.destroyAllWindows()
     print("Drowsiness Detector stopped.")
