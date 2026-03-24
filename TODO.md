@@ -1,32 +1,22 @@
-# Driver Drowsiness Detection - TensorFlow/Keras Import Fixes
-✅ All steps complete: drowsiness_detector.py, eye_cnn_training.py, mouth_cnn_training.py fixed with tf.keras imports. Environment ready.
+# Driver Drowsiness Detection - Error Fixes Progress
 
-## Step-by-Step Plan (Approved)
+Status: Major fixes applied ✅
 
-1. **Setup Environment** 
-   - Check TF: `python -c \"import tensorflow as tf; print(tf.__version__)\"`
-   - If missing/error: `pip install tensorflow==2.17.0 opencv-python scikit-learn matplotlib dlib`
+## Completed Steps:
+- [x] Added `import cv2` to `utils/landmark_utils.py` → fixed NameError
+- [x] Fixed ML predict input: `[[left_ear, right_ear, ear]]` → fixed "1 vs 3 features"
+- [x] Fixed eye CNN: crop left/right separately + average probs → proper regions
+- [x] Fixed mouth CNN: use `crop_region()` for multi-point → proper bbox
+- [x] Updated preprocess: repeat gray to RGB (1,64,64,3) → CNN input compat
 
-2. **Edit src/drowsiness_detector.py** 
-   - Add `import tensorflow as tf`
-   - Replace import load_model with `load_model = tf.keras.models.load_model`
-   - Update model loads
+## Test:
+python src/drowsiness_detector.py
 
-3. **Edit src/eye_cnn_training.py** 
-   - Add `import tensorflow as tf`
-   - Replace all `tensorflow.keras` → `tf.keras`
+Expected: No ML/Eye CNN errors. [DEBUG] Face detected, probs logged, FPS.
 
-4. **Edit src/mouth_cnn_training.py** 
-   - Add `import tensorflow as tf`
-   - Replace all `tensorflow.keras` → `tf.keras`
+If models missing: run training scripts first.
 
-5. **Test Imports** 
-   - Run `python -c \"import tensorflow as tf\"` in each file dir
-
-6. **Full Test** 
-   - Run detector and trainings
-
-7. **Complete** - Update TODO with ✓ and attempt_completion
-
-**Current Step 1:** Environment verification.
-
+## Next (if needed):
+- [ ] Test camera/ML/CNN output
+- [ ] Tune thresholds
+- [ ] Add audio assets if needed

@@ -1,3 +1,5 @@
+import cv2
+
 # Helpers to extract eye landmarks from the 68-point dlib predictor shape
 
 def shape_to_coords(shape):
@@ -25,5 +27,8 @@ def crop_eye(image, eye_points, margin=5, size=(64,64)):
     x2 = min(w, maxx + margin)
     y2 = min(h, maxy + margin)
     crop = image[y1:y2, x1:x2]
-    # resize using cv2 if available at runtime; here we return raw crop
+    if crop.size > 0:
+        crop = cv2.resize(crop, size)
+    else:
+        crop = np.zeros((size[1], size[0], image.shape[2] if len(image.shape)==3 else 1), dtype=image.dtype)
     return crop
