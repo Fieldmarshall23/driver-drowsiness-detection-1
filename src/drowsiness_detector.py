@@ -180,7 +180,7 @@ def crop_region(image, points, margin=10, size=(64,64)):
     return crop
 
 def detect_drowsiness(frame, detector, predictor):
-    global ear_counter, eye_cnn_counter, yawn_counter, side_start_time, last_audio_alert, frame_counter
+    global ear_counter, eye_cnn_counter, yawn_counter, side_start_time, last_audio_alert, frame_counter, ear_baseline, baseline_collected
     if frame is None:
         return None
     # Preprocess for robust detection
@@ -261,7 +261,7 @@ def detect_drowsiness(frame, detector, predictor):
     ear = (left_ear + right_ear) / 2.0
     
     # Step 2: EAR baseline collection
-    global ear_baseline, baseline_collected
+
     if not baseline_collected and frame_counter < EAR_BASELINE_FRAMES:
         if not hasattr(detect_drowsiness, 'ear_sum'):
             detect_drowsiness.ear_sum = 0.0
@@ -325,7 +325,7 @@ def detect_drowsiness(frame, detector, predictor):
     perclos = perclos_counter / PERCLOS_WINDOW
 
     # Step 4: Adaptive EAR threshold
-    global ear_baseline, EAR_THRESHOLD
+
     current_ear_thresh = ear_baseline * 0.8 if baseline_collected else EAR_THRESHOLD
 
     try:
