@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Test the specific TensorFlow/Keras imports that are failing
+Test the specific TensorFlow/Keras imports that are failing + utils imports
 """
 
 print("Testing TensorFlow/Keras imports...")
@@ -28,6 +28,19 @@ try:
     print("✅ Adam optimizer imported successfully")
 except ImportError as e:
     print(f"❌ Adam optimizer import failed: {e}")
+
+print("\nTesting utils imports...")
+try:
+    from utils.landmark_utils import shape_to_coords, get_left_eye, crop_eye
+    print("✅ utils.landmark_utils imported successfully")
+except ImportError as e:
+    print(f"❌ utils.landmark_utils import failed: {e}")
+
+try:
+    from utils.eye_aspect_ratio import eye_aspect_ratio
+    print("✅ utils.eye_aspect_ratio imported successfully")
+except ImportError as e:
+    print(f"❌ utils.eye_aspect_ratio import failed: {e}")
 
 # Test OpenCV
 try:

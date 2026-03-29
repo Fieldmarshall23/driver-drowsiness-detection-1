@@ -14,6 +14,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import tensorflow as tf
 warnings.filterwarnings('ignore', message='.*All `Callback`.*')
+warnings.filterwarnings('ignore', message='.*glibc.*')
+warnings.filterwarnings('ignore', message='.*unrecognized shape.*')
 from utils.landmark_utils import shape_to_coords, get_left_eye, get_right_eye, crop_eye
 from utils.eye_aspect_ratio import eye_aspect_ratio
 
@@ -30,6 +32,14 @@ SAVE_DEBUG_DIR = os.path.join(PROJECT_ROOT, 'outputs', 'debug_mouth')
 ALERT_LOG = os.path.join(PROJECT_ROOT, 'outputs', 'alerts.log')
 os.makedirs(ASSETS_DIR, exist_ok=True)
 os.makedirs(SAVE_DEBUG_DIR, exist_ok=True)
+
+# Logging setup for debugging
+import logging
+logging.basicConfig(level=logging.INFO, filename=ALERT_LOG, 
+                    format='%(asctime)s - %(levelname)s - %(message)s', 
+                    filemode='a')
+logger = logging.getLogger(__name__)
+
 DROWSY_SOUND_PATH = os.path.join(ASSETS_DIR, 'drowsy_alert.mp3')
 CONCENTRATE_SOUND_PATH = os.path.join(ASSETS_DIR, 'concentrate_alert.mp3')
 
@@ -40,6 +50,12 @@ yawn_counter = 0
 side_start_time = None
 last_audio_alert = 0.0
 frame_counter = 0
+perclos_counter = 0
+ear_baseline = 0.27
+baseline_collected = False
+ema_drowsy_prob = 0.0
+ema_eye_prob = 0.5
+ema_yawn_prob = 0.0
 heavy_process_frame = 0
 last_fps_time = 0.0
 fps = 0.0
@@ -56,8 +72,13 @@ SIDE_LEFT_RATIO = 0.35
 SIDE_RIGHT_RATIO = 0.65
 SAVE_DEBUG_THRESH = 0.4
 ALERT_AUDIO_COOLDOWN = 3.0
-DROWSY_PROB_THRESH = 0.6
-DROWSY_RESET_THRESH = 0.4
+DROWSY_PROB_THRESH = 0.65
+DROWSY_RESET_THRESH = 0.35
+# New improved constants
+PERCLOS_WINDOW = 300
+EMA_ALPHA = 0.3
+FUSION_WEIGHTS = [0.3, 0.25, 0.2, 0.15, 0.1]  # EAR, eye, yawn, ml, perclos
+EAR_BASELINE_FRAMES = 100
 
 # Initialize directories
 os.makedirs(SAVE_DEBUG_DIR, exist_ok=True)
@@ -79,100 +100,42 @@ EAR_MODEL_PATH = os.path.join(MODEL_DIR, 'ml_model.pkl')
 with open(EAR_MODEL_PATH, 'rb') as f:
     ear_model = pickle.load(f)
 
-try:
-    import pyttsx3
-    TTS_AVAILABLE = True
-except ImportError:
-    TTS_AVAILABLE = False
-    print("pyttsx3 not installed for TTS fallback. Install with: pip install pyttsx3")
+# Removed TTS dependency - using beep alerts only
+TTS_AVAILABLE = False
 
-tts_lock = threading.Lock()
-tts_engine = None
+counter_lock = threading.Lock()
 
 def play_drowsy_alert():
-    """Play drowsiness alert: MP3 → TTS → Beep."""
-    def _play():
-        print("[AUDIO] Drowsy alert!")
-        sound_path = DROWSY_SOUND_PATH
-        played = False
-        # 1. MP3
-        if playsound and os.path.exists(sound_path):
-            try:
-                playsound(sound_path)
-                played = True
-            except Exception as e:
-                print(f"[AUDIO] MP3 failed: {e}")
-        # 2. TTS
-        if not played and TTS_AVAILABLE:
-            if safe_tts_say("Pull over to rest! Drowsiness detected."):
-                played = True
-        # 3. Beep
-        if not played and platform.system() == "Windows":
-            try:
-                import winsound
-                winsound.Beep(800, 1000)
-                played = True
-            except:
-                pass
-    threading.Thread(target=_play, daemon=True).start()
+    """Non-blocking beep pattern for drowsy alert."""
+    logger.info("Drowsy alert triggered")
+    print("[AUDIO] Drowsy alert - BEEP PATTERN")
+    if platform.system() == "Windows":
+        try:
+            import winsound
+            # Triple beep: urgent pattern
+            winsound.Beep(800, 300)
+            time.sleep(0.1)
+            winsound.Beep(700, 300)
+            time.sleep(0.1)
+            winsound.Beep(900, 500)
+        except Exception as e:
+            logger.error(f"Winsound failed: {e}")
 
 def play_concentrate_alert():
-    """Play concentrate alert: MP3 → TTS → Beep."""
-    def _play():
-        print("[AUDIO] Concentrate alert!")
-        sound_path = CONCENTRATE_SOUND_PATH
-        played = False
-        # 1. MP3
-        if playsound and os.path.exists(sound_path):
-            try:
-                playsound(sound_path)
-                played = True
-            except Exception as e:
-                print(f"[AUDIO] MP3 failed: {e}")
-        # 2. TTS
-        if not played and TTS_AVAILABLE:
-            if safe_tts_say("Please concentrate! Eyes on the road."):
-                played = True
-        # 3. Beep
-        if not played and platform.system() == "Windows":
-            try:
-                import winsound
-                winsound.Beep(1200, 600)
-                played = True
-            except:
-                pass
-    threading.Thread(target=_play, daemon=True).start()
-
-def safe_tts_say(message):
-    """Safely use global TTS engine with loop reset."""
-    global tts_engine, TTS_AVAILABLE, tts_lock
-    if not TTS_AVAILABLE:
-        return False
-    with tts_lock:
+    """Non-blocking beep for concentrate alert."""
+    logger.info("Concentrate alert triggered")
+    print("[AUDIO] Concentrate alert - BEEP")
+    if platform.system() == "Windows":
         try:
-            if tts_engine is None:
-                temp_engine = pyttsx3.init()
-                voices = temp_engine.getProperty('voices')
-                if voices:
-                    temp_engine.setProperty('voice', voices[0].id)
-                    temp_engine.setProperty('rate', 180)
-                    tts_engine = temp_engine
-                else:
-                    raise RuntimeError("No TTS voices available")
-            tts_engine.stop()  # Reset any active loop
-            tts_engine.say(message)
-            tts_engine.runAndWait()
-            return True
+            import winsound
+            # Double high beep: attention
+            winsound.Beep(1200, 400)
+            time.sleep(0.1)
+            winsound.Beep(1400, 400)
         except Exception as e:
-            print(f"[TTS] Failed permanently: {e}")
-            TTS_AVAILABLE = False
-            if tts_engine is not None:
-                try:
-                    tts_engine.stop()
-                    tts_engine = None
-                except:
-                    pass
-            return False
+            logger.error(f"Winsound failed: {e}")
+
+# Removed safe_tts_say - no longer needed
 
 def preprocess_rgb(img):
     """Preprocess for RGB models (eyes) - outputs (1,64,64,3)"""
@@ -256,6 +219,8 @@ def detect_drowsiness(frame, detector, predictor):
     global heavy_process_frame
     heavy_process_frame = frame_counter % 2 == 0
     
+    alert_active = False
+    
     num_faces = len(faces)
     if frame_counter % 60 == 0:
         if max_faces_scale >= 0:
@@ -294,6 +259,19 @@ def detect_drowsiness(frame, detector, predictor):
     left_ear = eye_aspect_ratio(left_eye)
     right_ear = eye_aspect_ratio(right_eye)
     ear = (left_ear + right_ear) / 2.0
+    
+    # Step 2: EAR baseline collection
+    global ear_baseline, baseline_collected
+    if not baseline_collected and frame_counter < EAR_BASELINE_FRAMES:
+        if not hasattr(detect_drowsiness, 'ear_sum'):
+            detect_drowsiness.ear_sum = 0.0
+            detect_drowsiness.ear_count = 0
+        detect_drowsiness.ear_sum += ear
+        detect_drowsiness.ear_count += 1
+        if detect_drowsiness.ear_count >= EAR_BASELINE_FRAMES:
+            ear_baseline = detect_drowsiness.ear_sum / EAR_BASELINE_FRAMES
+            baseline_collected = True
+            print(f"[BASELINE] EAR baseline set to {ear_baseline:.3f}")
 
     eye_prob = 0.5
     yawn_prob = 0.0
@@ -316,9 +294,39 @@ def detect_drowsiness(frame, detector, predictor):
             mouth_region = crop_region(frame, mouth)
             mouth_input = preprocess_grayscale(mouth_region)
             yawn_prob = mouth_cnn.predict(mouth_input, verbose=0)[0][0]
+            
+            # Step 3: Mouth Aspect Ratio (MAR) for yawn validation
+            # Landmarks 51-57 (upper outer lip), 61-67 (lower outer lip)
+            mouth_points = coords[51:60] + coords[61:68]  # 6 upper + 6 lower
+            mouth_left = np.array([mouth_points[0], mouth_points[3]])
+            mouth_right = np.array([mouth_points[5], mouth_points[8]])
+            mouth_top = np.array([mouth_points[1], mouth_points[2]])
+            mouth_bottom = np.array([mouth_points[4], mouth_points[7]])
+            mar_v1 = np.linalg.norm(mouth_top - mouth_bottom)
+            mar_v2 = np.linalg.norm(mouth_left - mouth_right) * 2
+            mar = mar_v1 / mar_v2 if mar_v2 > 0 else 0.0
+            yawn_prob = max(0.0, min(1.0, yawn_prob * (1.0 + (mar - 0.02))))  # Boost if MAR high (>0.02 yawn)
         except Exception:
+            mar = 0.0
             pass
     eye_closed = eye_prob >= EYE_CNN_CLOSE_THRESH
+    
+    # Step 3: EMA smoothing on eye/yawn (use ema in fusion)
+    global ema_eye_prob, ema_yawn_prob
+    ema_eye_prob = EMA_ALPHA * eye_prob + (1 - EMA_ALPHA) * ema_eye_prob
+    ema_yawn_prob = EMA_ALPHA * yawn_prob + (1 - EMA_ALPHA) * ema_yawn_prob
+
+    # Step 4: PERCLOS counter
+    global perclos_counter
+    if eye_closed:
+        perclos_counter += 1
+    else:
+        perclos_counter = max(0, perclos_counter - 1)
+    perclos = perclos_counter / PERCLOS_WINDOW
+
+    # Step 4: Adaptive EAR threshold
+    global ear_baseline, EAR_THRESHOLD
+    current_ear_thresh = ear_baseline * 0.8 if baseline_collected else EAR_THRESHOLD
 
     try:
         if yawn_prob >= SAVE_DEBUG_THRESH:
@@ -346,32 +354,45 @@ def detect_drowsiness(frame, detector, predictor):
 
     # Drowsiness detection logic
     # EAR check
-    if ear < EAR_THRESHOLD:
-        ear_counter += 1
-    else:
-        ear_counter = 0
+    with counter_lock:
+        # Step 6: Smoother counters with decay (cap 50)
+        if ear < current_ear_thresh:
+            ear_counter = min(50, ear_counter * 1.02 + 1)
+        else:
+            ear_counter = max(0, ear_counter * 0.95)
 
-    # Eye CNN check
-    if eye_closed:
-        eye_cnn_counter += 1
-    else:
-        eye_cnn_counter = 0
+        # Eye CNN check - smoother decay
+        if eye_closed:
+            eye_cnn_counter = min(50, eye_cnn_counter * 1.02 + 1)
+        else:
+            eye_cnn_counter = max(0, eye_cnn_counter * 0.95)
 
-    # Yawn check
-    if yawn_prob >= YAWN_THRESH:
-        yawn_counter += 1
-    else:
-        yawn_counter = 0
+        # Yawn check - smoother decay
+        if yawn_prob >= YAWN_THRESH:
+            yawn_counter = min(50, yawn_counter * 1.02 + 1)
+        else:
+            yawn_counter = max(0, yawn_counter * 0.95)
 
-    # Fused drowsiness probability
-    ear_factor = 1.0 if ear < EAR_THRESHOLD else 0.0
-    eye_factor = 1.0 if eye_closed else eye_prob  # Use prob if not binary
-    yawn_factor = yawn_prob
+        # Periodic reset if no recent alerts (prevent stuck loop)
+        if frame_counter % 300 == 0 and not alert_active:
+            ear_counter = max(0, ear_counter // 2)
+            eye_cnn_counter = max(0, eye_cnn_counter // 2)
+            yawn_counter = max(0, yawn_counter // 2)
+            logger.info(f"Periodic counter reset: EAR={ear_counter}, EYE={eye_cnn_counter}, YAWN={yawn_counter}")
+
+# Step 5: Improved weighted fusion with normalization + PERCLOS
+    ear_factor = 1.0 if ear < current_ear_thresh else 0.0
+    eye_factor = ema_eye_prob
+    yawn_factor = ema_yawn_prob
     ml_factor = ml_pred
+    perclos_factor = perclos
     side_factor = min(1.0, side_duration / SIDE_LOOK_THRESH)
-    drowsy_prob = 0.25 * (ear_factor + eye_factor + yawn_factor + ml_factor + side_factor)
+    
+    # Normalize to [0,1]
+    factors = [ear_factor, eye_factor, yawn_factor, ml_factor, perclos_factor]
+    drowsy_prob = sum(w * f for w, f in zip(FUSION_WEIGHTS, factors))
     if frame_counter % 30 == 0:
-        print(f"[DETECT] Frame{frame_counter} EAR:{ear:.2f} eye:{eye_prob:.2f} yawn:{yawn_prob:.2f} drowsy:{drowsy_prob:.2f} side:{side_duration:.1f}")
+        print(f"[DETECT] Frame{frame_counter} EAR:{ear:.2f} EMA-eye:{ema_eye_prob:.2f} EMA-yawn:{ema_yawn_prob:.2f} PERCLOS:{perclos:.3f} drowsy:{drowsy_prob:.2f} side:{side_duration:.1f} thresh:{current_ear_thresh:.3f}")
 
     # Update counters
     if drowsy_prob >= DROWSY_PROB_THRESH:
@@ -426,10 +447,12 @@ def detect_drowsiness(frame, detector, predictor):
     cv2.rectangle(frame, (face.left(), face.top()), (face.right(), face.bottom()), (0, 255, 0), 2)
     cv2.putText(frame, f"EAR: {ear:.2f}", (20,80),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,0), 2)
-    cv2.putText(frame, f"Eye Prob: {eye_prob:.2f}", (20,110),
+    cv2.putText(frame, f"Eye EMA: {ema_eye_prob:.2f}", (20,110),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,0), 2)
-    cv2.putText(frame, f"Yawn Prob: {yawn_prob:.2f}", (20,140),
+    cv2.putText(frame, f"Yawn EMA: {ema_yawn_prob:.2f}", (20,140),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,0), 2)
+    cv2.putText(frame, f"PERCLOS: {perclos:.3f}", (20,200),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,0), 2)
     cv2.putText(frame, f"NosePos: {nose_norm:.2f}", (20,170),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200,200,0), 2)
     if side_duration > 0:
@@ -470,16 +493,29 @@ def main():
     print("Drowsiness Detector started. Press 'q' to quit.")
 
     bad_frames = 0
+    loop_start = time.time()
     while True:
+        if time.time() - loop_start > 300:  # 5min timeout safety
+            logger.warning("Loop timeout - restarting cap")
+            cap.release()
+            cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            loop_start = time.time()
+        
         ret, frame = cap.read()
         # Robust frame validation
         if (not ret or frame is None or len(frame.shape) != 3 or 
             frame.shape[0] < 1 or frame.shape[1] < 1):
             bad_frames += 1
-            if bad_frames > 100:
-                print("Too many consecutive bad frames. Exiting.")
-                break
-            print(f"Warning: Skipping invalid frame (bad_frames={bad_frames}).")
+            logger.warning(f"Bad frame #{bad_frames}")
+            if bad_frames > 50:
+                logger.error("Too many bad frames - resetting camera")
+                cap.release()
+                cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+                bad_frames = 0
             continue
         
         bad_frames = 0
@@ -494,6 +530,8 @@ def main():
         if now_time - last_fps_time > 1.0:
             fps = frame_counter / (now_time - last_fps_time)
             print(f"[DEBUG] FPS: {fps:.1f} | Frame: {frame_counter} | Counters EAR:{ear_counter} EYE:{eye_cnn_counter} YAWN:{yawn_counter}")
+            logger.info(f"FPS={fps:.1f}, bad_frames={bad_frames}, ear_counter={ear_counter}")
+            sys.stdout.flush()
             frame_counter = 0
             last_fps_time = now_time
         
