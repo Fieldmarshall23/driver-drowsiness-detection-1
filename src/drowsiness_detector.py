@@ -16,7 +16,7 @@ import tensorflow as tf
 warnings.filterwarnings('ignore', message='.*All `Callback`.*')
 warnings.filterwarnings('ignore', message='.*glibc.*')
 warnings.filterwarnings('ignore', message='.*unrecognized shape.*')
-from utils.landmark_utils import shape_to_coords, get_left_eye, get_right_eye, crop_eye
+from utils.landmark_utils import shape_to_coords, get_left_eye, get_right_eye, crop_eye, head_pose, eye_gaze_offset
 from utils.eye_aspect_ratio import eye_aspect_ratio
 
 try:
@@ -67,17 +67,17 @@ EYE_CNN_CLOSE_THRESH = 0.5
 EYE_CNN_CONSEC = 8      # Increased
 YAWN_THRESH = 0.5
 YAWN_CONSEC = 3
-SIDE_LOOK_THRESH = 3.0
-SIDE_LEFT_RATIO = 0.35
-SIDE_RIGHT_RATIO = 0.65
+SIDE_LOOK_THRESH = 2.0
+HEAD_YAW_THRESH = 30.0  # degrees
+GAZE_OFFSET_THRESH = 0.4
 SAVE_DEBUG_THRESH = 0.4
 ALERT_AUDIO_COOLDOWN = 3.0
-DROWSY_PROB_THRESH = 0.65
-DROWSY_RESET_THRESH = 0.35
+DROWSY_PROB_THRESH = 0.50  # TEMP LOWERED FOR DEBUG
+DROWSY_RESET_THRESH = 0.30
 # New improved constants
 PERCLOS_WINDOW = 300
 EMA_ALPHA = 0.3
-FUSION_WEIGHTS = [0.3, 0.25, 0.2, 0.15, 0.1]  # EAR, eye, yawn, ml, perclos
+FUSION_WEIGHTS = [0.25, 0.25, 0.2, 0.15, 0.1, 0.05]  # EAR, eye, yawn, ml, perclos, gaze
 EAR_BASELINE_FRAMES = 100
 
 # Initialize directories
@@ -91,14 +91,32 @@ if not os.path.exists(PREDICTOR_PATH):
         " and place it in the project root or update PREDICTOR_PATH."
     )
 
-eye_cnn = tf.keras.models.load_model(os.path.join(MODEL_DIR, 'cnn_model.h5'))
+try:
+    eye_cnn = tf.keras.models.load_model(os.path.join(MODEL_DIR, 'cnn_model.h5'))
+    print("[MODEL] Eye CNN loaded successfully")
+except Exception as e:
+    print(f"[ERROR] Failed to load eye_cnn 'cnn_model.h5': {e}")
+    eye_cnn = None
+    logger.error(f"Eye CNN load failed: {e}")
 
 # Load mouth CNN model
-mouth_cnn = tf.keras.models.load_model(os.path.join(MODEL_DIR, 'mouth_cnn_model.h5'))
+try:
+    mouth_cnn = tf.keras.models.load_model(os.path.join(MODEL_DIR, 'mouth_cnn_model.h5'))
+    print("[MODEL] Mouth CNN loaded successfully")
+except Exception as e:
+    print(f"[ERROR] Failed to load mouth_cnn 'mouth_cnn_model.h5': {e}")
+    mouth_cnn = None
+    logger.error(f"Mouth CNN load failed: {e}")
 
 EAR_MODEL_PATH = os.path.join(MODEL_DIR, 'ml_model.pkl')
-with open(EAR_MODEL_PATH, 'rb') as f:
-    ear_model = pickle.load(f)
+try:
+    with open(EAR_MODEL_PATH, 'rb') as f:
+        ear_model = pickle.load(f)
+    print("[MODEL] EAR ML model loaded successfully")
+except Exception as e:
+    print(f"[ERROR] Failed to load ear_model 'ml_model.pkl': {e}")
+    ear_model = None
+    logger.error(f"EAR model load failed: {e}")
 
 # Removed TTS dependency - using beep alerts only
 TTS_AVAILABLE = False
@@ -256,6 +274,12 @@ def detect_drowsiness(frame, detector, predictor):
     left_eye = np.array(get_left_eye(coords))
     right_eye = np.array(get_right_eye(coords))
 
+    # High accuracy: head pose and gaze
+    yaw, pitch, roll = head_pose(coords, gray.shape)
+    left_gaze = eye_gaze_offset(left_eye)
+    right_gaze = eye_gaze_offset(right_eye)
+    avg_gaze_offset = (left_gaze + right_gaze) / 2.0
+
     left_ear = eye_aspect_ratio(left_eye)
     right_ear = eye_aspect_ratio(right_eye)
     ear = (left_ear + right_ear) / 2.0
@@ -338,12 +362,8 @@ def detect_drowsiness(frame, detector, predictor):
     except Exception:
         pass
 
-    x_coords = [p[0] for p in coords]
-    minx, maxx = min(x_coords), max(x_coords)
-    nose_x = coords[30][0]
-    face_w = maxx - minx if (maxx - minx) > 0 else 1
-    nose_norm = (nose_x - minx) / face_w
-    side_looking = (nose_norm < SIDE_LEFT_RATIO) or (nose_norm > SIDE_RIGHT_RATIO)
+    # Improved sideways detection: head yaw + gaze offset (more accurate than nose)
+    side_looking = (abs(yaw) > HEAD_YAW_THRESH) or (abs(avg_gaze_offset) > GAZE_OFFSET_THRESH)
     if side_looking:
         if side_start_time is None:
             side_start_time = time.time()
@@ -380,19 +400,23 @@ def detect_drowsiness(frame, detector, predictor):
             yawn_counter = max(0, yawn_counter // 2)
             logger.info(f"Periodic counter reset: EAR={ear_counter}, EYE={eye_cnn_counter}, YAWN={yawn_counter}")
 
-# Step 5: Improved weighted fusion with normalization + PERCLOS
+    # Step 5: High accuracy fusion with gaze (separate drowsy vs concentrate)
     ear_factor = 1.0 if ear < current_ear_thresh else 0.0
     eye_factor = ema_eye_prob
     yawn_factor = ema_yawn_prob
     ml_factor = ml_pred
     perclos_factor = perclos
-    side_factor = min(1.0, side_duration / SIDE_LOOK_THRESH)
+    gaze_factor = abs(avg_gaze_offset)
     
-    # Normalize to [0,1]
-    factors = [ear_factor, eye_factor, yawn_factor, ml_factor, perclos_factor]
-    drowsy_prob = sum(w * f for w, f in zip(FUSION_WEIGHTS, factors))
+    # Drowsy prob (eyes/yawn heavy)
+    drowsy_factors = [ear_factor, eye_factor, yawn_factor, ml_factor, perclos_factor]
+    drowsy_prob = sum(w * f for w, f in zip(FUSION_WEIGHTS[:-1], drowsy_factors))  # Exclude gaze for drowsy
+    
+    # Side/Concentrate factor
+    concentrate_factor = min(1.0, side_duration / SIDE_LOOK_THRESH) * gaze_factor
+    
     if frame_counter % 30 == 0:
-        print(f"[DETECT] Frame{frame_counter} EAR:{ear:.2f} EMA-eye:{ema_eye_prob:.2f} EMA-yawn:{ema_yawn_prob:.2f} PERCLOS:{perclos:.3f} drowsy:{drowsy_prob:.2f} side:{side_duration:.1f} thresh:{current_ear_thresh:.3f}")
+        print(f"[DETECT] Frame{frame_counter} EAR:{ear:.2f} eye:{ema_eye_prob:.2f} yawn:{ema_yawn_prob:.2f} PERCLOS:{perclos:.3f} drowsy:{drowsy_prob:.2f} yaw:{yaw:.1f} gaze:{avg_gaze_offset:.2f} side:{side_duration:.1f}")
 
     # Update counters
     if drowsy_prob >= DROWSY_PROB_THRESH:
@@ -403,61 +427,70 @@ def detect_drowsiness(frame, detector, predictor):
         yawn_counter = max(0, yawn_counter - 1)
 
     # Alert conditions
-    alert_active = (ear_counter >= EAR_CONSEC_FRAMES or 
-                   eye_cnn_counter >= EYE_CNN_CONSEC or 
-                   yawn_counter >= YAWN_CONSEC or 
-                   side_duration >= SIDE_LOOK_THRESH or
-                   drowsy_prob >= DROWSY_PROB_THRESH)
+    # High accuracy alerts: drowsy (0.7+ or counters), concentrate (side 2s+), focus (else green)
+    is_drowsy = (ear_counter >= EAR_CONSEC_FRAMES or eye_cnn_counter >= EYE_CNN_CONSEC or 
+                 yawn_counter >= YAWN_CONSEC or drowsy_prob >= DROWSY_PROB_THRESH)
+    is_concentrate = (side_duration >= SIDE_LOOK_THRESH and abs(yaw) > 15 and abs(avg_gaze_offset) > 0.3)
+    
+    alert_active = is_drowsy or is_concentrate
+    
     if alert_active:
-        print(f"[ALERT] TRIGGERED! drowsy_prob={drowsy_prob:.2f} ear_counter={ear_counter} eye_cnn={eye_cnn_counter} yawn={yawn_counter} side={side_duration:.1f}")
-        # Task-specific warnings
-        is_drowsy = (ear_counter >= EAR_CONSEC_FRAMES or eye_cnn_counter >= EYE_CNN_CONSEC or 
-                    yawn_counter >= YAWN_CONSEC or drowsy_prob >= DROWSY_PROB_THRESH)
-        is_looking_away = side_duration >= SIDE_LOOK_THRESH
+        print(f"[ALERT] drowsy:{drowsy_prob:.2f} ear:{ear_counter} eye:{eye_cnn_counter} yawn:{yawn_counter} side:{side_duration:.1f}s yaw:{yaw:.1f} gaze:{avg_gaze_offset:.2f}")
         
         if is_drowsy:
-            drowsy_msgs = ["PULLOVER TO REST!", "DROWSINESS DETECTED - REST NOW!", "TAKE A BREAK - SAFETY FIRST!"]
-            msg = drowsy_msgs[frame_counter % len(drowsy_msgs)]
+            # Thick red drowsy (high danger)
+            drowsy_msgs = ["🚨 DROWSY - PULL OVER NOW!", "🚨 EYES CLOSED - STOP!", "🚨 DROWSINESS HIGH - REST!"]
+            msg = drowsy_msgs[frame_counter % 3]
             play_drowsy_alert()
-        elif is_looking_away:
-            concentrate_msgs = ["PLEASE CONCENTRATE!", "EYES ON ROAD!", "FOCUS FORWARD - SAFETY!"]
-            msg = concentrate_msgs[frame_counter % len(concentrate_msgs)]
+            border_color = (0,0,255)
+            border_thick = 8
+        elif is_concentrate:
+            # Red concentrate (sideways)
+            concentrate_msgs = ["⚠️ FOCUS ROAD!", "⚠️ EYES FORWARD!", "⚠️ CONCENTRATE!"]
+            msg = concentrate_msgs[frame_counter % 3]
             play_concentrate_alert()
+            border_color = (0,0,200)
+            border_thick = 5
         else:
-            msg = "Alert Active!"
+            msg = "ALERT"
+            border_color = (0,0,255)
+            border_thick = 5
         
-        msg2 = f"Drowsy: {drowsy_prob:.1f} | Side: {side_duration:.1f}s"
-
+        msg2 = f"Drowsy:{drowsy_prob:.1f} Side:{side_duration:.1f}s Yaw:{yaw:.0f}°"
+        
         now = time.time()
         if now - last_audio_alert >= ALERT_AUDIO_COOLDOWN:
             last_audio_alert = now
 
-        # Red border + warnings
-        cv2.rectangle(frame, (0,0), (frame.shape[1],frame.shape[0]), (0,0,255), 5)
-        cv2.putText(frame, msg, (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0,0,255), 3)
-        cv2.putText(frame, msg2, (20, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,0,255), 2)
+        # Dynamic red border
+        cv2.rectangle(frame, (0,0), (frame.shape[1],frame.shape[0]), border_color, border_thick)
+        cv2.putText(frame, msg, (20, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.9, border_color, 3)
+        cv2.putText(frame, msg2, (20, 110), cv2.FONT_HERSHEY_SIMPLEX, 0.6, border_color, 2)
         
     else:
-        # Safe: Green ROAD FOCUS ON
-        cv2.putText(frame, "ROAD FOCUS: ON ✓", (20, 50), 
-                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 3)
+        # Green focused (eyes open, frontal gaze)
+        if abs(yaw) < 15 and abs(avg_gaze_offset) < 0.3 and ear > current_ear_thresh * 0.9:
+            msg = "👁️ FOCUSED ✓ ROAD WATCHED"
+            cv2.putText(frame, msg, (20, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 3)
+        else:
+            msg = "ROAD FOCUS: OK"
+            cv2.putText(frame, msg, (20, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
         cv2.rectangle(frame, (0,0), (frame.shape[1],frame.shape[0]), (0,255,0), 2)
 
-    # Draw face box, EAR, probs
+    # Enhanced viz with yaw/gaze
     cv2.rectangle(frame, (face.left(), face.top()), (face.right(), face.bottom()), (0, 255, 0), 2)
-    cv2.putText(frame, f"EAR: {ear:.2f}", (20,80),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,0), 2)
-    cv2.putText(frame, f"Eye EMA: {ema_eye_prob:.2f}", (20,110),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,0), 2)
-    cv2.putText(frame, f"Yawn EMA: {ema_yawn_prob:.2f}", (20,140),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,0), 2)
-    cv2.putText(frame, f"PERCLOS: {perclos:.3f}", (20,200),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,0), 2)
-    cv2.putText(frame, f"NosePos: {nose_norm:.2f}", (20,170),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200,200,0), 2)
-    if side_duration > 0:
-        cv2.putText(frame, f"SideSecs: {side_duration:.1f}s", (20,200),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200,200,0), 2)
+    
+    # Core metrics
+    cv2.putText(frame, f"EAR: {ear:.2f}", (20, frame.shape[0]-160), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,0), 1)
+    cv2.putText(frame, f"EyeP: {ema_eye_prob:.1f}", (20, frame.shape[0]-140), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,0), 1)
+    cv2.putText(frame, f"YawnP: {ema_yawn_prob:.1f}", (20, frame.shape[0]-120), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,0), 1)
+    cv2.putText(frame, f"Drowsy: {drowsy_prob:.1f}", (20, frame.shape[0]-100), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,0), 1)
+    
+    # High accuracy metrics
+    cv2.putText(frame, f"Yaw: {yaw:.0f}°", (20, frame.shape[0]-80), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,255), 1)
+    cv2.putText(frame, f"Gaze: {avg_gaze_offset:+.2f}", (20, frame.shape[0]-60), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,255), 1)
+    cv2.putText(frame, f"PERCLOS: {perclos:.2f}", (20, frame.shape[0]-40), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,0), 1)
+    cv2.putText(frame, f"Side: {side_duration:.1f}s", (20, frame.shape[0]-20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,255), 1)
 
     return frame
 
