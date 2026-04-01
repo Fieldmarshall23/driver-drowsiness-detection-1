@@ -17,6 +17,7 @@ uvicorn[standard]==0.38.0
 playsound==1.2.2
 
 # Native / build-time helpers
+mediapipe==0.10.14
 dlib==20.0.0
 cmake==4.1.2
 

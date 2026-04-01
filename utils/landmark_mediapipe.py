@@ -5,21 +5,20 @@ from typing import List, Tuple, Optional
 
 mp_face_mesh = mp.solutions.face_mesh
 
-# High accuracy MediaPipe FaceMesh
+# MediaPipe FaceMesh config
 FACE_MESH = mp_face_mesh.FaceMesh(
     static_image_mode=False,
     max_num_faces=1,
-    refine_landmarks=True,  # Iris landmarks for precise gaze/eyes
+    refine_landmarks=True,
     min_detection_confidence=0.5,
     min_tracking_confidence=0.5
 )
 
-# Precise MediaPipe eye indices (full contour + iris)
 LEFT_EYE_IDX = [33, 7, 163, 144, 145, 153, 154, 155, 133, 173, 157, 158, 159, 160, 161, 246]
 RIGHT_EYE_IDX = [362, 382, 381, 380, 374, 373, 390, 249, 263, 466, 388, 387, 386, 385, 384, 398]
 
 def eye_aspect_ratio(eye_coords: List[Tuple[int, int]]) -> float:
-    """Standard Eye Aspect Ratio (EAR) using 6-point formula."""
+    """Standard EAR."""
     if len(eye_coords) < 6:
         return 1.0
     p1, p2, p3, p4, p5, p6 = eye_coords
@@ -29,40 +28,30 @@ def eye_aspect_ratio(eye_coords: List[Tuple[int, int]]) -> float:
     ear = (A + B) / (2.0 * C)
     return ear
 
-def detect_landmarks(image: np.ndarray) -> Optional[List[Tuple[int, int]]]:
-    """Detect landmarks using MediaPipe (returns pixel coords or None)."""
-    image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-    results = FACE_MESH.process(image_rgb)
-    if not results.multi_face_landmarks:
-        return None
-    face_landmarks = results.multi_face_landmarks[0].landmark
-    h, w = image.shape[:2]
-    return [(int(lm.x * w), int(lm.y * h)) for lm in face_landmarks]
+def landmarks_to_coords(landmarks: List, image_shape: Tuple[int, int] = None) -> List[Tuple[int, int]]:
+    """Convert normalized landmarks to pixel coords."""
+    if image_shape is None:
+        h, w = 480, 640
+    else:
+        h, w = image_shape[:2]
+    if landmarks and isinstance(landmarks[0], tuple):
+        return landmarks  # already pixel
+    return [(int(lm.x * w), int(lm.y * h)) for lm in landmarks]
 
-def shape_to_coords(landmarks) -> List[Tuple[int, int]]:
-    """Convert dlib shape or return pixel landmarks."""
-    if hasattr(landmarks, 'num_parts') and landmarks.num_parts == 68:
-        return [(int(landmarks.part(i).x), int(landmarks.part(i).y)) for i in range(68)]
-    return landmarks
+def shape_to_coords(landmarks: List) -> List[Tuple[int, int]]:
+    """Alias."""
+    return landmarks_to_coords(landmarks)
 
 def get_left_eye(landmarks: List[Tuple[int, int]]) -> List[Tuple[int, int]]:
-    """Left eye landmarks (dlib or MP indices based on len)."""
-    if len(landmarks) <= 70:  # dlib ~68 pts
-        idx = [36, 37, 38, 39, 40, 41]
-    else:
-        idx = LEFT_EYE_IDX[:6]
-    return [landmarks[i] for i in idx]
+    """Left eye."""
+    return [landmarks[i] for i in LEFT_EYE_IDX]
 
 def get_right_eye(landmarks: List[Tuple[int, int]]) -> List[Tuple[int, int]]:
-    """Right eye landmarks (dlib or MP indices based on len)."""
-    if len(landmarks) <= 70:  # dlib ~68 pts
-        idx = [42, 43, 44, 45, 46, 47]
-    else:
-        idx = RIGHT_EYE_IDX[:6]
-    return [landmarks[i] for i in idx]
+    """Right eye."""
+    return [landmarks[i] for i in RIGHT_EYE_IDX]
 
 def crop_eye(image: np.ndarray, eye_points: List[Tuple[int, int]], margin=10, size=(64,64)) -> np.ndarray:
-    """Enhanced eye crop: percentile bounds, CLAHE, grayscale, cubic resize."""
+    """Eye crop with enhancement."""
     if len(eye_points) < 3:
         return np.zeros((size[1], size[0]), dtype=np.uint8)
     xs = [p[0] for p in eye_points]
@@ -73,7 +62,7 @@ def crop_eye(image: np.ndarray, eye_points: List[Tuple[int, int]], margin=10, si
     y2 = min(image.shape[0], int(np.percentile(ys, 95)) + margin)
     if x2 <= x1 or y2 <= y1:
         return np.zeros((size[1], size[0]), dtype=np.uint8)
-    crop = image[y1:y2, x1:x2].copy()
+    crop = image[y1:y2, x1:x2]
     if len(crop.shape) == 3:
         crop = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
@@ -82,34 +71,34 @@ def crop_eye(image: np.ndarray, eye_points: List[Tuple[int, int]], margin=10, si
     return crop
 
 def eye_aspect_ratio_vertical(eye_coords: List[Tuple[int, int]]) -> float:
-    """Improved vertical ratio."""
+    """Vertical EAR variant."""
     if len(eye_coords) < 6:
         return 1.0
     ys = [p[1] for p in eye_coords]
     upper = min(ys[:3])
-    lower = max(ys[3:6])
+    lower = max(ys[3:])
     v_dist = lower - upper
     eye_h = max(ys) - min(ys)
     return v_dist / eye_h if eye_h > 0 else 1.0
 
 def head_pose(landmarks: List[Tuple[int, int]], image_shape: Tuple[int, int]) -> Tuple[float, float, float]:
-    """Improved PnP head pose with MediaPipe key points."""
+    """Head pose from pixel landmarks."""
     if len(landmarks) < 6:
         return 0.0, 0.0, 0.0
-    mp_indices = [1, 152, 33, 362, 61, 291]  # nose, chin, LE, RE, LM, RM
+    idx = [1, 152, 33, 362, 61, 291]
     model_points = np.array([
-        (0.0, 0.0, 0.0),       
-        (0.0, -330.0, -65.0),  
-        (-225.0, 170.0, -135.0), 
-        (225.0, 170.0, -135.0),  
-        (-150.0, -150.0, -125.0), 
-        (150.0, -150.0, -125.0)   
+        (0.0, 0.0, 0.0),
+        (0.0, -330.0, -65.0),
+        (-225.0, 170.0, -135.0),
+        (225.0, 170.0, -135.0),
+        (-150.0, -150.0, -125.0),
+        (150.0, -150.0, -125.0)
     ], dtype="double")
-    image_points = np.array([landmarks[i] for i in mp_indices if i < len(landmarks)], dtype="double")
+    image_points = np.array([landmarks[i] for i in idx if i < len(landmarks)], dtype="double")
     if len(image_points) < 4:
         return 0.0, 0.0, 0.0
     h, w = image_shape[:2]
-    focal_length = w * 0.8
+    focal_length = w
     center = (w / 2., h / 2.)
     camera_matrix = np.array([
         [focal_length, 0, center[0]],
@@ -126,11 +115,11 @@ def head_pose(landmarks: List[Tuple[int, int]], image_shape: Tuple[int, int]) ->
     return float(yaw), float(pitch), float(roll)
 
 def eye_gaze_offset(eye_coords: List[Tuple[int, int]]) -> float:
-    """Improved gaze using inner eye points."""
+    """Gaze offset."""
     if len(eye_coords) < 6:
         return 0.0
     cx = sum(p[0] for p in eye_coords) / len(eye_coords)
-    inner = eye_coords[2:5] if len(eye_coords) > 4 else eye_coords[-3:]
+    inner = eye_coords[:3]
     px = sum(p[0] for p in inner) / len(inner)
     eye_w = max(p[0] for p in eye_coords) - min(p[0] for p in eye_coords)
     if eye_w == 0:
@@ -138,6 +127,13 @@ def eye_gaze_offset(eye_coords: List[Tuple[int, int]]) -> float:
     offset = (px - cx) / (eye_w / 2)
     return np.clip(offset, -1.0, 1.0)
 
-# Disabled dlib fallback to avoid errors (requires dlib + 'shape_predictor_68_face_landmarks.dat')
-# See instructions if needed.
+def detect_landmarks(image: np.ndarray) -> Optional[List[Tuple[int, int]]]:
+    """Main entry: detect pixel landmarks."""
+    image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    results = FACE_MESH.process(image_rgb)
+    if not results.multi_face_landmarks:
+        return None
+    face_landmarks = results.multi_face_landmarks[0].landmark
+    h, w = image.shape[:2]
+    return [(int(lm.x * w), int(lm.y * h)) for lm in face_landmarks]
 
