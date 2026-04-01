@@ -1,12 +1,20 @@
-# Driver Drowsiness Detection Fix: OpenCV RQDecomp3x3 Error
+# Fixing RHDA Error: Install Dependencies in Virtual Environment
 
-## Task: Fix head_pose() matrix assertion error in landmark_utils.py
+## Steps:
+- [x] 1. ✓ 'drowzy/' is valid venv (pyvenv.cfg, Scripts/).
 
-✅ **COMPLETED: All Errors Fixed!**
+# Skipped 2 (already exists)
 
-**Summary:**
-- **RQDecomp3x3:** Fixed 3x4 matrix → direct 3x3 rotation_mat ✅
-- **NameError np:** Added local import in eye_gaze_offset ✅
-- **Test Ready:** Run `python src/drowsiness_detector.py` - expect stable FPS, yaw/gaze values, no crashes
+- [x] 3. ✓ Activated venv `(drowzy)`
 
-**Final Status:** Driver drowsiness detector fully functional with head pose & gaze detection.
+- [x] 4. ✓ All deps installed ("Requirement already satisfied" for uvicorn[standard], fastapi, tensorflow==2.12.0, dlib==20.0.0, etc.)
+
+- [ ] 5. Verify: `python test_imports.py` (running...)
+
+- [ ] 6. VSCode: 
+  - Reload window (Ctrl+Shift+P > Developer: Reload Window).
+  - Python: Select Interpreter > `c:/Users/kmaka/Desktop/project/driver-drowsiness-detection/drowzy/Scripts/python.exe`.
+  - Optional: Add to `.vscode/settings.json`: `{ "python.defaultInterpreterPath": ".\\drowzy\\Scripts\\python.exe", "python.analysis.useVirtualEnv": true }`
+
+- [ ] 7. Deactivate: `deactivate` (when done).
+
