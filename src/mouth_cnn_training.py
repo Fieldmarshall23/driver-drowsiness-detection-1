@@ -1,15 +1,28 @@
+# ========================================
+# MOUTH CNN TRAINING SCRIPT
+# ========================================
+# Trains binary CNN for yawn/no_yawn detection (grayscale)
+# Dataset: dataset/no_yawn/ (0) vs dataset/yawn/ (1)
+# Features: Augmentation (rot/shift/bright/zoom), grayscale input
+# Output: models/mouth_cnn_model.h5
+
 import os
 import numpy as np
 import matplotlib.pyplot as plt
 import tensorflow as tf
 
+# ========================================
+# CONFIGURATION CONSTANTS
+# ========================================
 DATA_DIR = 'dataset'
 MODEL_DIR = 'models'
 IMG_SIZE = (64, 64)
 BATCH_SIZE = 32
 EPOCHS = 20
 
+# Ensure model directory exists
 os.makedirs(MODEL_DIR, exist_ok=True)
+
 
 def build_model(input_shape=(64,64,1)):
     model = tf.keras.models.Sequential([

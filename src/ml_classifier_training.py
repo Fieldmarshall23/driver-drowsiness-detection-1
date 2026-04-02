@@ -1,3 +1,11 @@
+# ========================================
+# EAR ML CLASSIFIER TRAINING SCRIPT
+# ========================================
+# Trains scikit-learn RandomForest on EAR features (left/right/avg)
+# Dataset: dataset/open_eyes/ (0) vs closed_eyes/ (1)
+# Robust face detection: dlib (multi-scale) + OpenCV Haar fallback
+# Output: models/ml_model.pkl
+
 """
 Robust ML classifier training script (EAR-based)
 
@@ -9,6 +17,7 @@ the `models/` directory.
 It resolves paths relative to the project root so the script can be
 invoked from any working directory.
 """
+
 
 from __future__ import annotations
 

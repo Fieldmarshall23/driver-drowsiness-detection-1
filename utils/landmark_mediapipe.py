@@ -1,3 +1,9 @@
+# ========================================
+# MEDIAPIPE LANDMARK UTILITIES (LIGHTWEIGHT)
+# ========================================
+# MediaPipe FaceMesh wrapper + utils (duplicates landmark_utils.py subset).
+# Standalone for direct use without full utils import.
+
 import cv2
 import mediapipe as mp
 import numpy as np
@@ -5,17 +11,21 @@ from typing import List, Tuple, Optional
 
 mp_face_mesh = mp.solutions.face_mesh
 
-# MediaPipe FaceMesh config
+# ========================================
+# FACE MESH CONFIG
+# ========================================
 FACE_MESH = mp_face_mesh.FaceMesh(
     static_image_mode=False,
     max_num_faces=1,
-    refine_landmarks=True,
+    refine_landmarks=True,  # Enable iris for gaze accuracy
     min_detection_confidence=0.5,
     min_tracking_confidence=0.5
 )
 
+# MediaPipe eye indices (full contours)
 LEFT_EYE_IDX = [33, 7, 163, 144, 145, 153, 154, 155, 133, 173, 157, 158, 159, 160, 161, 246]
 RIGHT_EYE_IDX = [362, 382, 381, 380, 374, 373, 390, 249, 263, 466, 388, 387, 386, 385, 384, 398]
+
 
 def eye_aspect_ratio(eye_coords: List[Tuple[int, int]]) -> float:
     """Standard EAR."""

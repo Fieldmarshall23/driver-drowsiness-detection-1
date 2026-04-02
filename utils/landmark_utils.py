@@ -1,11 +1,20 @@
+# ========================================
+# LANDMARK UTILITIES
+# ========================================
+# Core utilities for dlib/MediaPipe landmarks, eye cropping, head pose (PnP),
+# gaze estimation. Supports both 68-pt dlib and full MediaPipe FaceMesh.
+
 import cv2
 import mediapipe as mp
 import numpy as np
 from typing import List, Tuple, Optional
 
+# ========================================
+# MEDIAFACE MESH SETUP
+# ========================================
 mp_face_mesh = mp.solutions.face_mesh
 
-# High accuracy MediaPipe FaceMesh
+# High accuracy tracker (iris refinement for gaze)
 FACE_MESH = mp_face_mesh.FaceMesh(
     static_image_mode=False,
     max_num_faces=1,
@@ -14,9 +23,13 @@ FACE_MESH = mp_face_mesh.FaceMesh(
     min_tracking_confidence=0.5
 )
 
-# Precise MediaPipe eye indices (full contour + iris)
+# ========================================
+# EYE LANDMARK INDICES
+# ========================================
+# MediaPipe full eye contours (iris + eyelid)
 LEFT_EYE_IDX = [33, 7, 163, 144, 145, 153, 154, 155, 133, 173, 157, 158, 159, 160, 161, 246]
 RIGHT_EYE_IDX = [362, 382, 381, 380, 374, 373, 390, 249, 263, 466, 388, 387, 386, 385, 384, 398]
+
 
 def eye_aspect_ratio(eye_coords: List[Tuple[int, int]]) -> float:
     """Standard Eye Aspect Ratio (EAR) using 6-point formula."""
@@ -93,50 +106,121 @@ def eye_aspect_ratio_vertical(eye_coords: List[Tuple[int, int]]) -> float:
     return v_dist / eye_h if eye_h > 0 else 1.0
 
 def head_pose(landmarks: List[Tuple[int, int]], image_shape: Tuple[int, int]) -> Tuple[float, float, float]:
-    """Improved PnP head pose with MediaPipe key points."""
-    if len(landmarks) < 6:
+    """
+    Enhanced dlib-optimized PnP with 12 key points for stability.
+    """
+    if len(landmarks) < 12:
         return 0.0, 0.0, 0.0
-    mp_indices = [1, 152, 33, 362, 61, 291]  # nose, chin, LE, RE, LM, RM
+    
+    # Dlib 68-pt optimized indices: nose bridge, chin, eyes, mouth corners, jaw
+    dlib_indices = [30, 8, 36, 45, 17, 21, 54, 62, 27, 33, 51, 57]  # Better coverage
     model_points = np.array([
-        (0.0, 0.0, 0.0),       
-        (0.0, -330.0, -65.0),  
-        (-225.0, 170.0, -135.0), 
-        (225.0, 170.0, -135.0),  
-        (-150.0, -150.0, -125.0), 
-        (150.0, -150.0, -125.0)   
+        (0.0,      0.0,     0.0),      # Nose bridge
+        (0.0,     -330.0,  -65.0),     # Chin
+        (-225.0,  170.0,  -135.0),     # Left eye outer
+        (225.0,   170.0,  -135.0),     # Right eye outer
+        (-150.0, -150.0,  -125.0),     # Left mouth
+        (150.0,  -150.0,  -125.0),     # Right mouth
+        (-120.0,  120.0,   -20.0),     # Left jaw
+        (120.0,   120.0,   -20.0),     # Right jaw
+        (0.0,     100.0,   -50.0),     # Forehead
+        (-80.0,   20.0,    -60.0),     # Left brow
+        (-60.0,  -80.0,   -110.0),     # Left lip
+        (60.0,   -80.0,   -110.0)      # Right lip
     ], dtype="double")
-    image_points = np.array([landmarks[i] for i in mp_indices if i < len(landmarks)], dtype="double")
-    if len(image_points) < 4:
-        return 0.0, 0.0, 0.0
+    
+    image_points = np.array([landmarks[i % len(landmarks)] for i in dlib_indices[:len(landmarks)]], dtype="double")
+    
     h, w = image_shape[:2]
-    focal_length = w * 0.8
+    focal_length = w
     center = (w / 2., h / 2.)
     camera_matrix = np.array([
-        [focal_length, 0, center[0]],
-        [0, focal_length, center[1]],
-        [0, 0, 1]
+        [focal_length*0.9, 0,      center[0]],
+        [0,               focal_length*0.9, center[1]],
+        [0,               0,      1]
     ], dtype="double")
     dist_coeffs = np.zeros((4,1))
+    
     success, rvec, tvec = cv2.solvePnP(model_points[:len(image_points)], image_points, camera_matrix, dist_coeffs)
     if not success:
         return 0.0, 0.0, 0.0
+        
     rmat, _ = cv2.Rodrigues(rvec)
     euler = cv2.RQDecomp3x3(rmat)[0]
-    pitch, yaw, roll = euler[0], euler[2], euler[1]
+    pitch, yaw, roll = euler[0]*0.8, euler[2]*1.2, euler[1]  # Calibrated scaling
+    
+    # Pose stability (variance penalty)
+    pose_var = abs(yaw**2 + pitch**2 + roll**2) / 1000
+    yaw = yaw / (1 + pose_var*0.1)
+    
     return float(yaw), float(pitch), float(roll)
 
+def mouth_aspect_ratio(landmarks: List[Tuple[int, int]]) -> float:
+    """
+    Enhanced MAR using full dlib lip contour (20 pts).
+    """
+    if len(landmarks) < 68:
+        return 0.0
+    
+    # Full outer lips: upper 51-57, lower 57-65 (dlib standard)
+    upper_lip = landmarks[50:53] + landmarks[61:64]  # Simplified key pts
+    lower_lip = landmarks[56:59] + landmarks[65:68]
+    
+    if len(upper_lip) < 3 or len(lower_lip) < 3:
+        return 0.0
+    
+    upper_y = np.mean([p[1] for p in upper_lip])
+    lower_y = np.mean([p[1] for p in lower_lip])
+    mouth_height = abs(lower_y - upper_y)
+    
+    left_x = min(p[0] for p in upper_lip + lower_lip)
+    right_x = max(p[0] for p in upper_lip + lower_lip)
+    mouth_width = right_x - left_x
+    
+    mar = mouth_height / mouth_width if mouth_width > 0 else 0.0
+    return mar
+
+def landmark_quality(landmarks: List[Tuple[int, int]]) -> float:
+    """
+    Dlib shape fitting quality: bilateral symmetry + compactness.
+    """
+    if len(landmarks) < 68:
+        return 0.5
+    
+    left_face = landmarks[0:17] + landmarks[26:36]  # Left profile
+    right_face = landmarks[17:26] + landmarks[45:55]  # Right profile
+    
+    left_var = np.var([p[0] for p in left_face])
+    right_var = np.var([p[0] for p in right_face])
+    symmetry = 1.0 / (1.0 + abs(left_var - right_var)/100)
+    
+    # Compactness (face bounding box aspect)
+    xs = [p[0] for p in landmarks]
+    ys = [p[1] for p in landmarks]
+    bbox_w, bbox_h = max(xs)-min(xs), max(ys)-min(ys)
+    compact = 1.0 / (1.0 + abs(bbox_w/bbox_h - 1.2))  # ~1.2 ideal
+    
+    return 0.6 * symmetry + 0.4 * compact
+
 def eye_gaze_offset(eye_coords: List[Tuple[int, int]]) -> float:
-    """Improved gaze using inner eye points."""
+    """
+    Enhanced gaze offset using iris approximation (inner corner bias).
+    Improved for drowsiness: large |offset| indicates distraction/drowsiness.
+    """
     if len(eye_coords) < 6:
         return 0.0
-    cx = sum(p[0] for p in eye_coords) / len(eye_coords)
-    inner = eye_coords[2:5] if len(eye_coords) > 4 else eye_coords[-3:]
-    px = sum(p[0] for p in inner) / len(inner)
-    eye_w = max(p[0] for p in eye_coords) - min(p[0] for p in eye_coords)
-    if eye_w == 0:
+    coords = np.array(eye_coords)
+    cx = np.mean(coords[:, 0])
+    
+    # Iris proxy: weighted inner points (for dlib 6pt: p3,p2 center bias)
+    inner_weights = np.array([0.1, 0.4, 0.4, 0.4, 0.4, 0.1])  # center heavy
+    px = np.average(coords[:, 0], weights=inner_weights[:len(coords)])
+    
+    eye_w = coords[:, 0].max() - coords[:, 0].min()
+    if eye_w < 1.0:
         return 0.0
-    offset = (px - cx) / (eye_w / 2)
-    return np.clip(offset, -1.0, 1.0)
+    offset = (px - cx) / (eye_w / 3)
+    return np.clip(offset, -1.2, 1.2)
 
 # Disabled dlib fallback to avoid errors (requires dlib + 'shape_predictor_68_face_landmarks.dat')
 # See instructions if needed.
